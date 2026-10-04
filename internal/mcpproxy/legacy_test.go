@@ -1288,15 +1288,21 @@ func Test_maybeResponseModify(t *testing.T) {
 		require.NoError(t, m.maybeResponseModify(ctx, &jsonrpc.Request{Method: "resources/read"}, msg, backend))
 		require.NotContains(t, string(msg.Result), `"cacheScope":""`)
 		require.Contains(t, string(msg.Result), `"ttlMs":0`)
-		require.Contains(t, string(msg.Result), `"cacheScope":"public"`)
+		require.Contains(t, string(msg.Result), `"cacheScope":"private"`)
 		require.Contains(t, string(msg.Result), `"uri":"backend1+file:///notes.txt"`)
 	})
 
+	t.Run("resources/read replaces an empty cacheScope sent by the backend", func(t *testing.T) {
+		msg := &jsonrpc.Response{Result: []byte(`{"ttlMs":0,"cacheScope":"","contents":[{"uri":"file:///notes.txt","text":"hello"}]}`)}
+		require.NoError(t, m.maybeResponseModify(ctx, &jsonrpc.Request{Method: "resources/read"}, msg, backend))
+		require.Contains(t, string(msg.Result), `"cacheScope":"private"`)
+	})
+
 	t.Run("resources/read preserves backend caching hints", func(t *testing.T) {
-		msg := &jsonrpc.Response{Result: []byte(`{"ttlMs":5000,"cacheScope":"private","contents":[{"uri":"file:///notes.txt","text":"hello"}]}`)}
+		msg := &jsonrpc.Response{Result: []byte(`{"ttlMs":5000,"cacheScope":"public","contents":[{"uri":"file:///notes.txt","text":"hello"}]}`)}
 		require.NoError(t, m.maybeResponseModify(ctx, &jsonrpc.Request{Method: "resources/read"}, msg, backend))
 		require.Contains(t, string(msg.Result), `"ttlMs":5000`)
-		require.Contains(t, string(msg.Result), `"cacheScope":"private"`)
+		require.Contains(t, string(msg.Result), `"cacheScope":"public"`)
 	})
 }
 
