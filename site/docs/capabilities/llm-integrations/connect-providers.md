@@ -92,7 +92,6 @@ spec:
   apiKey:
     secretRef:
       name: openai-secret
-      namespace: default
 ```
 
 :::note
@@ -137,7 +136,6 @@ spec:
     credentialsFile:
       secretRef:
         name: aws-secret
-        namespace: default
       profile: default # Optional, defaults to "default"
 ```
 
@@ -161,7 +159,6 @@ spec:
     tenantID: "your-azure-tenant-id"
     clientSecretRef:
       name: azure-secret
-      namespace: default
 ```
 
 :::note
@@ -361,7 +358,6 @@ spec:
   apiKey:
     secretRef:
       name: openai-secret
-      namespace: default
 
 ---
 # Routing configuration
