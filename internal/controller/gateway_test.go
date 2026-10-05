@@ -1361,11 +1361,17 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 
 func TestGatewayController_bspToFilterAPIBackendAuth_ErrorCases(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
-	c := newTestGatewayController(fakeClient, fake2.NewClientset(), ctrl.Log, "envoy-gateway-system",
+	kube := fake2.NewClientset()
+	c := newTestGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	ctx := context.Background()
 	namespace := "test-namespace"
+	_, err := kube.CoreV1().Secrets(namespace).Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "wrong-key-secret", Namespace: namespace},
+		Data:       map[string][]byte{"not-" + apiKeyInSecret: []byte("value")},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
 
 	tests := []struct {
 		name          string
@@ -1390,6 +1396,22 @@ func TestGatewayController_bspToFilterAPIBackendAuth_ErrorCases(t *testing.T) {
 			expectedError: "failed to get secret test-namespace/missing-secret",
 		},
 		{
+			name:    "api key type with secret missing the key",
+			bspName: "api-key-wrong-key-bsp",
+			bsp: &aigv1b1.BackendSecurityPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "api-key-wrong-key-bsp", Namespace: namespace},
+				Spec: aigv1b1.BackendSecurityPolicySpec{
+					Type: aigv1b1.BackendSecurityPolicyTypeAPIKey,
+					APIKey: &aigv1b1.BackendSecurityPolicyAPIKey{
+						SecretRef: &gwapiv1.SecretObjectReference{
+							Name: "wrong-key-secret",
+						},
+					},
+				},
+			},
+			expectedError: "secret test-namespace/wrong-key-secret does not contain key apiKey",
+		},
+		{
 			name:    "api key type with nil secretRef",
 			bspName: "api-key-nil-ref-bsp",
 			bsp: &aigv1b1.BackendSecurityPolicy{
@@ -1399,7 +1421,7 @@ func TestGatewayController_bspToFilterAPIBackendAuth_ErrorCases(t *testing.T) {
 					APIKey: &aigv1b1.BackendSecurityPolicyAPIKey{},
 				},
 			},
-			expectedError: "secretRef is not set for policy api-key-nil-ref-bsp",
+			expectedError: "secretRef is not set for policy test-namespace/api-key-nil-ref-bsp",
 		},
 		{
 			name:    "aws credentials with credentials file missing secret",

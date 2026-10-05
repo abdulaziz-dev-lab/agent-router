@@ -1038,7 +1038,7 @@ func (c *GatewayController) getSecretData(ctx context.Context, namespace, name, 
 func (c *GatewayController) getBSPSecretRefData(ctx context.Context, bsp *aigv1b1.BackendSecurityPolicy, dataKey string) (string, error) {
 	name, namespace, ok := backendSecurityPolicySecretRef(bsp)
 	if !ok {
-		return "", fmt.Errorf("secretRef is not set for policy %s", bsp.Name)
+		return "", fmt.Errorf("secretRef is not set for policy %s/%s", bsp.Namespace, bsp.Name)
 	}
 	if err := c.referenceGrantValidator.validateSecretReference(ctx, bsp.Namespace, namespace, name); err != nil {
 		return "", err
