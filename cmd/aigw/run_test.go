@@ -140,6 +140,25 @@ func TestRunCmdContext_writeEnvoyResourcesAndRunExtProc_crossNamespaceSecret(t *
 		require.Contains(t, envoyGatewayResources.String(), "kind: ReferenceGrant",
 			"Envoy Gateway needs the ReferenceGrant too")
 	})
+
+	t.Run("without ReferenceGrant", func(t *testing.T) {
+		runCtx := &runCmdContext{
+			envoyGatewayResourcesOut: &bytes.Buffer{},
+			stderrLogger:             slog.New(slog.DiscardHandler),
+			stderr:                   io.Discard,
+			tmpdir:                   t.TempDir(),
+		}
+		// Reconcile errors panic in aigw, so the missing grant stops it instead of the backend being
+		// silently left out.
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			_, _, _, _ = runCtx.writeEnvoyResourcesAndRunExtProc(t.Context(), crossNamespaceSecretConfig)
+		}()
+		err, ok := recovered.(error)
+		require.True(t, ok, "expected a panic with an error, got %v", recovered)
+		require.ErrorContains(t, err, "is not permitted")
+	})
 }
 
 func Test_mustStartExtProc(t *testing.T) {
