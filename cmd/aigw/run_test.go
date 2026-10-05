@@ -105,6 +105,43 @@ func TestRunCmdContext_writeEnvoyResourcesAndRunExtProc_noListeners(t *testing.T
 	require.EqualError(t, err, "gateway aigw-run has no listeners configured")
 }
 
+//go:embed testdata/cross_namespace_secret.yaml
+var crossNamespaceSecretConfig string
+
+//go:embed testdata/cross_namespace_secret_grant.yaml
+var crossNamespaceSecretGrant string
+
+func TestRunCmdContext_writeEnvoyResourcesAndRunExtProc_crossNamespaceSecret(t *testing.T) {
+	t.Run("allowed by ReferenceGrant", func(t *testing.T) {
+		envoyGatewayResources := &bytes.Buffer{}
+		var capturedArgs []string
+		runCtx := &runCmdContext{
+			envoyGatewayResourcesOut: envoyGatewayResources,
+			stderrLogger:             slog.New(slog.DiscardHandler),
+			stderr:                   io.Discard,
+			tmpdir:                   t.TempDir(),
+			extProcLauncher: func(ctx context.Context, args []string, _ io.Writer) error {
+				capturedArgs = args
+				<-ctx.Done()
+				return nil
+			},
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		_, done, _, err := runCtx.writeEnvoyResourcesAndRunExtProc(ctx, crossNamespaceSecretConfig+"\n---\n"+crossNamespaceSecretGrant)
+		require.NoError(t, err)
+		cancel()
+		require.NoError(t, <-done)
+
+		cfg := requireExtProcConfigBundle(t, findFlagValue(capturedArgs, "--configBundlePath"))
+		require.Len(t, cfg.Backends, 1)
+		require.NotNil(t, cfg.Backends[0].Auth)
+		require.NotNil(t, cfg.Backends[0].Auth.APIKey)
+		require.Equal(t, "shared-api-key", cfg.Backends[0].Auth.APIKey.Key)
+		require.Contains(t, envoyGatewayResources.String(), "kind: ReferenceGrant",
+			"Envoy Gateway needs the ReferenceGrant too")
+	})
+}
+
 func Test_mustStartExtProc(t *testing.T) {
 	mockErr := errors.New("mock extproc error")
 	var capturedArgs []string
@@ -121,16 +158,7 @@ func Test_mustStartExtProc(t *testing.T) {
 	done := runCtx.mustStartExtProc(t.Context(), &filterapi.Config{Version: version.Parse()})
 	require.ErrorIs(t, <-done, mockErr)
 
-	bundlePath := findFlagValue(capturedArgs, "--configBundlePath")
-	require.NotEmpty(t, bundlePath)
-	indexRaw, err := os.ReadFile(filepath.Join(bundlePath, filterapi.ConfigBundleIndexFileName))
-	require.NoError(t, err)
-	index, err := filterapi.UnmarshalConfigBundleIndex(indexRaw)
-	require.NoError(t, err)
-	cfg, err := filterapi.ReassembleBundleConfig(index, func(part filterapi.ConfigBundlePart) ([]byte, error) {
-		return os.ReadFile(filepath.Join(bundlePath, filepath.FromSlash(part.Path)))
-	})
-	require.NoError(t, err)
+	cfg := requireExtProcConfigBundle(t, findFlagValue(capturedArgs, "--configBundlePath"))
 	require.Equal(t, version.Parse(), cfg.Version)
 }
 
@@ -364,6 +392,21 @@ func Test_newRunnerErrorHandler(t *testing.T) {
 			}
 		})
 	}
+}
+
+// requireExtProcConfigBundle reads back the filter config that mustStartExtProc wrote to bundlePath.
+func requireExtProcConfigBundle(t *testing.T, bundlePath string) *filterapi.Config {
+	t.Helper()
+	require.NotEmpty(t, bundlePath)
+	indexRaw, err := os.ReadFile(filepath.Join(bundlePath, filterapi.ConfigBundleIndexFileName))
+	require.NoError(t, err)
+	index, err := filterapi.UnmarshalConfigBundleIndex(indexRaw)
+	require.NoError(t, err)
+	cfg, err := filterapi.ReassembleBundleConfig(index, func(part filterapi.ConfigBundlePart) ([]byte, error) {
+		return os.ReadFile(filepath.Join(bundlePath, filepath.FromSlash(part.Path)))
+	})
+	require.NoError(t, err)
+	return cfg
 }
 
 func findFlagValue(args []string, flag string) string {
