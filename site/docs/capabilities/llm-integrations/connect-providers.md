@@ -238,6 +238,28 @@ spec:
             namespace: default
 ```
 
+##### Secrets in another namespace
+
+A `secretRef` or `clientSecretRef` without `namespace` refers to a Secret in the BackendSecurityPolicy's own namespace. A Secret in another namespace also needs a [ReferenceGrant](https://gateway-api.sigs.k8s.io/api-types/referencegrant/) in the Secret's namespace that allows the reference. Without it, the BackendSecurityPolicy is marked `NotAccepted`.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-backend-security-policy-secrets
+  namespace: credentials # the Secret's namespace
+spec:
+  from:
+    - group: aigateway.envoyproxy.io
+      kind: BackendSecurityPolicy
+      namespace: ai-backends # the BackendSecurityPolicy's namespace
+  to:
+    - group: ""
+      kind: Secret
+```
+
+With `aigw run`, put the ReferenceGrant in the configuration file.
+
 #### Security Best Practices
 
 - **Store credentials in Kubernetes Secrets**: Never expose sensitive data in plain text
