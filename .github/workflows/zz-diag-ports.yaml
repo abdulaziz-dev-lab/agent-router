@@ -1,0 +1,55 @@
+# DIAGNOSTIC - fork only, not for upstream.
+name: Diag ports
+on:
+  push:
+    branches:
+      - "diag/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    name: "diag (${{ matrix.os }} #${{ matrix.rep }})"
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+        rep: [1, 2, 3]
+        include:
+          - os: ubuntu-latest
+            rep: 1
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v5
+        with:
+          cache: false
+          go-version-file: go.mod
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ~/go/bin
+          key: data-plane-tests-${{ hashFiles('**/go.mod', '**/go.sum', '**/Makefile') }}
+      - name: Port probe (fresh VM)
+        run: go test ./internal/testing/ -run TestDiagPortProbe -v -count=1 -timeout 30m
+        env:
+          PORT_PROBE_DIAG: "1"
+          PORT_PROBE_LABEL: fresh
+      - name: Data plane tests
+        if: always()
+        run: make test-data-plane
+      - name: Port probe (after data plane tests)
+        if: always()
+        run: go test ./internal/testing/ -run TestDiagPortProbe -v -count=1 -timeout 30m
+        env:
+          PORT_PROBE_DIAG: "1"
+          PORT_PROBE_LABEL: after-data-plane
+      - name: Data plane MCP tests
+        if: always()
+        run: make test-data-plane-mcp
