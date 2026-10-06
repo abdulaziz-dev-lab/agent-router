@@ -56,8 +56,11 @@ func TestRunExtprocStartFailure(t *testing.T) {
 		errChan <- run(ctx, &cmdRun{}, opts, os.Stdout, io.Discard)
 	}()
 
+	// run returns only after Envoy Gateway shuts down, which waits for its initial load of the
+	// resources even when the context is already canceled. That is slow under -race, and this
+	// timeout only needs to catch run hanging after the extproc fails.
 	select {
-	case <-time.After(10 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("expected extproc start to fail promptly")
 	case err := <-errChan:
 		require.ErrorIs(t, err, errExtProcRun)
