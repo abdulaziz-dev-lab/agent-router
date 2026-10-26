@@ -366,9 +366,10 @@ func TestNewReferenceGrantController(t *testing.T) {
 	aiGatewayRouteChan := make(chan event.GenericEvent, 10)
 	backendSecurityPolicyChan := make(chan event.GenericEvent, 10)
 	quotaPolicyChan := make(chan event.GenericEvent, 10)
+	mcpRouteChan := make(chan event.GenericEvent, 10)
 	logger := logr.Discard()
 
-	controller := NewReferenceGrantController(fakeClient, logger, aiGatewayRouteChan, backendSecurityPolicyChan, quotaPolicyChan, nil)
+	controller := NewReferenceGrantController(fakeClient, logger, aiGatewayRouteChan, backendSecurityPolicyChan, quotaPolicyChan, mcpRouteChan)
 
 	require.NotNil(t, controller)
 	require.Equal(t, fakeClient, controller.client)
@@ -376,6 +377,7 @@ func TestNewReferenceGrantController(t *testing.T) {
 	require.Equal(t, aiGatewayRouteChan, controller.aiGatewayRouteChan)
 	require.Equal(t, backendSecurityPolicyChan, controller.backendSecurityPolicyChan)
 	require.Equal(t, quotaPolicyChan, controller.quotaPolicyChan)
+	require.Equal(t, mcpRouteChan, controller.mcpRouteChan)
 }
 
 // TestReferenceGrantController_Reconcile_GetError tests reconcile when Get returns error
