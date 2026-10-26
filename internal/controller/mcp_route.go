@@ -100,16 +100,22 @@ func (c *MCPRouteController) syncMCPRoute(ctx context.Context, mcpRoute *aigv1b1
 	// A backend whose Secret reference is not permitted by a ReferenceGrant must not keep the credential
 	// the controller copied for it while a grant existed. Converge those backends first, sync the rest of
 	// the route as usual, and report the denial through the status at the end, the way
-	// BackendSecurityPolicy handles a denied grant.
-	denied, grantErr, err := c.revokeDeniedSecretRefs(ctx, mcpRoute)
+	// BackendSecurityPolicy handles a denied grant. The denial is reported next to any error of the later
+	// steps: the denied backends' objects are already gone, and the status must say why.
+	denied, err := c.revokeDeniedSecretRefs(ctx, mcpRoute)
 	if err != nil {
 		return err
 	}
+	return errors.Join(c.syncMCPRouteResources(ctx, mcpRoute, denied), denied.err)
+}
 
+// syncMCPRouteResources creates or updates the resources of the MCPRoute, skipping the backends in
+// denied, which revokeDeniedSecretRefs has converged to the never-granted state.
+func (c *MCPRouteController) syncMCPRouteResources(ctx context.Context, mcpRoute *aigv1b1.MCPRoute, denied deniedSecretRefs) error {
 	// Validate prefixMode=Never (whether set per-backend or inherited from the route-level
 	// default): each effectively-Never backend must declare toolSelector.include, and tool
 	// names must be unique across all effectively-Never backends on the route.
-	if err = validatePerBackendPrefixMode(mcpRoute); err != nil {
+	if err := validatePerBackendPrefixMode(mcpRoute); err != nil {
 		return err
 	}
 
@@ -153,7 +159,7 @@ func (c *MCPRouteController) syncMCPRoute(ctx context.Context, mcpRoute *aigv1b1
 	for i := range mcpRoute.Spec.BackendRefs {
 		ref := &mcpRoute.Spec.BackendRefs[i]
 		name := mcpPerBackendRefHTTPRouteName(mcpRoute.Name, ref.Name)
-		if _, ok := denied[name]; ok {
+		if denied.has(name) {
 			// Already converged to the never-granted state by revokeDeniedSecretRefs; keep it out of the
 			// orphan cleanup as well.
 			delete(existingPerBackendRoutes, name)
@@ -188,22 +194,35 @@ func (c *MCPRouteController) syncMCPRoute(ctx context.Context, mcpRoute *aigv1b1
 	if err != nil {
 		return fmt.Errorf("failed to sync gw pods: %w", err)
 	}
-	return grantErr
+	return nil
+}
+
+// deniedSecretRefs is what revokeDeniedSecretRefs found: the per-backend HTTPRoute names of the backends
+// whose Secret reference no ReferenceGrant permits, and their denials joined in spec order (nil when
+// nothing is denied).
+type deniedSecretRefs struct {
+	httpRouteNames map[string]struct{}
+	err            error
+}
+
+// has reports whether the backend with the given per-backend HTTPRoute name is denied.
+func (d deniedSecretRefs) has(httpRouteName string) bool {
+	_, ok := d.httpRouteNames[httpRouteName]
+	return ok
 }
 
 // revokeDeniedSecretRefs converges every backend whose apiKey.secretRef points at a Secret in another
 // namespace that no ReferenceGrant allows to the never-granted state: the per-backend HTTPRoute,
 // HTTPRouteFilter and credential Secret generated while a grant existed are deleted, so a revoked or
-// narrowed grant stops the data plane from injecting the copied credential. It returns the names of the
-// denied backends' HTTPRoutes and the joined ReferenceNotPermittedErrors in spec order (nil when nothing
-// is denied). Any other error aborts the sync so the next reconcile retries.
+// narrowed grant stops the data plane from injecting the copied credential. Any error other than a
+// denial aborts the sync so the next reconcile retries.
 //
 // This runs before the per-backend loop on purpose: that loop stops at its first error, so a backend
 // with an unrelated persistent error earlier in the spec must not keep a later backend's revoked
 // credential alive.
-func (c *MCPRouteController) revokeDeniedSecretRefs(ctx context.Context, mcpRoute *aigv1b1.MCPRoute) (map[string]struct{}, error, error) {
-	denied := make(map[string]struct{})
-	var grantErrs []error
+func (c *MCPRouteController) revokeDeniedSecretRefs(ctx context.Context, mcpRoute *aigv1b1.MCPRoute) (deniedSecretRefs, error) {
+	denied := deniedSecretRefs{httpRouteNames: make(map[string]struct{})}
+	var denials []error
 	for i := range mcpRoute.Spec.BackendRefs {
 		ref := &mcpRoute.Spec.BackendRefs[i]
 		if ref.SecurityPolicy == nil || ref.SecurityPolicy.APIKey == nil {
@@ -220,16 +239,32 @@ func (c *MCPRouteController) revokeDeniedSecretRefs(ctx context.Context, mcpRout
 		}
 		var notPermitted *ReferenceNotPermittedError
 		if !errors.As(err, &notPermitted) {
-			return nil, nil, fmt.Errorf("failed to validate the Secret reference of backend %s: %w", ref.Name, err)
+			return deniedSecretRefs{}, fmt.Errorf("failed to validate the Secret reference of backend %s: %w", ref.Name, err)
 		}
 		name := mcpPerBackendRefHTTPRouteName(mcpRoute.Name, ref.Name)
 		if err = c.deletePerBackendResources(ctx, mcpRoute, name); err != nil {
-			return nil, nil, fmt.Errorf("failed to delete the resources of backend %s: %w", ref.Name, err)
+			return deniedSecretRefs{}, fmt.Errorf("failed to delete the resources of backend %s: %w", ref.Name, err)
 		}
-		denied[name] = struct{}{}
-		grantErrs = append(grantErrs, fmt.Errorf("backend %s: %w", ref.Name, notPermitted))
+		denied.httpRouteNames[name] = struct{}{}
+		denials = append(denials, fmt.Errorf("backend %s: %w", ref.Name, notPermitted))
 	}
-	return denied, errors.Join(grantErrs...), nil
+	denied.err = joinDenials(denials)
+	return denied, nil
+}
+
+// maxReportedDenials bounds the denials listed in the status: the CRD caps a condition message at 32768
+// bytes, one denial takes up to about 1 KiB with maximum-length names, and a route has up to 256
+// backends.
+const maxReportedDenials = 10
+
+// joinDenials joins the per-backend denials in spec order, listing at most maxReportedDenials of them
+// and counting the rest.
+func joinDenials(denials []error) error {
+	if n := len(denials); n > maxReportedDenials {
+		denials = append(denials[:maxReportedDenials:maxReportedDenials],
+			fmt.Errorf("%d more backends have a Secret reference that is not permitted", n-maxReportedDenials))
+	}
+	return errors.Join(denials...)
 }
 
 func mcpPerBackendRefHTTPRouteName(mcpRouteName string, backendName gwapiv1.ObjectName) string {

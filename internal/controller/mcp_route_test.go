@@ -8,6 +8,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	egv1a1 "github.com/envoyproxy/gateway/api/v1alpha1"
@@ -1827,7 +1828,8 @@ func TestMCPRouteController_Reconcile_SecretRefGrantRevokedMixedRoute(t *testing
 
 // TestMCPRouteController_Reconcile_SecretRefGrantRevokedAfterFailingBackend verifies that a revoked
 // backend converges even when a backend earlier in the spec has an unrelated persistent error that stops
-// the per-backend loop, and that the failing backend keeps its last good objects.
+// the per-backend loop, that the failing backend keeps its last good objects, and that the status
+// reports the denial next to that error.
 func TestMCPRouteController_Reconcile_SecretRefGrantRevokedAfterFailingBackend(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexesForMCP(t)
 	kubeClient := fakekube.NewClientset(
@@ -1861,7 +1863,8 @@ func TestMCPRouteController_Reconcile_SecretRefGrantRevokedAfterFailingBackend(t
 	require.NoError(t, fakeClient.Delete(t.Context(), grant))
 	_, err = c.Reconcile(t.Context(), req)
 	require.ErrorContains(t, err, `failed to get secret for API key: secrets "broken-secret" not found`)
-	requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeNotAccepted, `secrets "broken-secret" not found`)
+	require.ErrorContains(t, err, "backend svc-revoked: cross-namespace reference from MCPRoute in namespace default to Secret some-secret in namespace shared is not permitted")
+	requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeNotAccepted, `secrets "broken-secret" not found`, "backend svc-revoked: ")
 	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-revoked", false, "")
 	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-broken", true, "Bearer broken-value")
 }
@@ -2115,4 +2118,103 @@ func TestMCPRouteController_deletePerBackendResources(t *testing.T) {
 			require.NoError(t, c.deletePerBackendResources(t.Context(), route, httpRouteName))
 		})
 	}
+}
+
+// TestMCPRouteController_Reconcile_DenialReportedWithLaterError verifies that a backend's denial stays
+// in the error and in the status when a later step fails: the denied backend's objects are already
+// gone, so the status must say why.
+func TestMCPRouteController_Reconcile_DenialReportedWithLaterError(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexesForMCP(t)
+	kubeClient := fakekube.NewClientset(
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "some-secret", Namespace: "shared"}, Data: map[string][]byte{"apiKey": []byte("shared-value")}},
+	)
+	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+	c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), eventCh.Ch)
+	require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}}))
+	route := &aigv1b1.MCPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default"},
+		Spec: aigv1b1.MCPRouteSpec{
+			ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}},
+			BackendRefs: []aigv1b1.MCPRouteBackendRef{
+				mcpRouteSecretRefBackend("svc-broken", "default", "", "missing-secret"),
+				mcpRouteSecretRefBackend("svc-denied", "default", "shared", "some-secret"),
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), route))
+
+	_, err := c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(route)})
+	const denial = "backend svc-denied: cross-namespace reference from MCPRoute in namespace default to Secret some-secret in namespace shared is not permitted"
+	require.ErrorContains(t, err, `secrets "missing-secret" not found`)
+	require.ErrorContains(t, err, denial)
+	var notPermitted *ReferenceNotPermittedError
+	require.ErrorAs(t, err, &notPermitted)
+	requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeNotAccepted, `secrets "missing-secret" not found`, denial)
+	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-denied", false, "")
+}
+
+// TestMCPRouteController_Reconcile_ManyDenialsFitTheStatus revokes the grant of a route whose 150
+// backends all read the same foreign Secret. The CRD caps a condition message at 32768 bytes, so the
+// status lists the denials up to a limit and counts the rest; it must still turn NotAccepted. The fake
+// client rejects longer messages the way the API server does.
+func TestMCPRouteController_Reconcile_ManyDenialsFitTheStatus(t *testing.T) {
+	const conditionMessageLimit = 32768
+	builder := fake.NewClientBuilder().WithScheme(Scheme).
+		WithStatusSubresource(&aigv1b1.MCPRoute{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if route, ok := obj.(*aigv1b1.MCPRoute); ok {
+					for i, cond := range route.Status.Conditions {
+						if len(cond.Message) > conditionMessageLimit {
+							return fmt.Errorf("status.conditions[%d].message: Too long: may not be more than %d bytes", i, conditionMessageLimit)
+						}
+					}
+				}
+				return c.SubResource(sub).Update(ctx, obj, opts...)
+			},
+		})
+	require.NoError(t, ApplyIndexing(t.Context(), func(_ context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
+		builder = builder.WithIndex(obj, field, extractValue)
+		return nil
+	}))
+	fakeClient := builder.Build()
+	kubeClient := fakekube.NewClientset(
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "some-secret", Namespace: "shared"}, Data: map[string][]byte{"apiKey": []byte("shared-value")}},
+	)
+	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+	c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), eventCh.Ch)
+	require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}}))
+	grant := mcpRouteSecretGrant("shared", "default", "")
+	require.NoError(t, fakeClient.Create(t.Context(), grant))
+
+	const backends = 150
+	route := &aigv1b1.MCPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default"},
+		Spec:       aigv1b1.MCPRouteSpec{ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}}},
+	}
+	for i := range backends {
+		route.Spec.BackendRefs = append(route.Spec.BackendRefs,
+			mcpRouteSecretRefBackend(gwapiv1.ObjectName(fmt.Sprintf("svc-%03d", i)), "default", "shared", "some-secret"))
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), route))
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(route)}
+	_, err := c.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeAccepted)
+
+	require.NoError(t, fakeClient.Delete(t.Context(), grant))
+	_, err = c.Reconcile(t.Context(), req)
+	require.Error(t, err)
+	var current aigv1b1.MCPRoute
+	require.NoError(t, fakeClient.Get(t.Context(), req.NamespacedName, &current))
+	require.Len(t, current.Status.Conditions, 1)
+	cond := current.Status.Conditions[0]
+	require.Equal(t, aigv1b1.ConditionTypeNotAccepted, cond.Type)
+	require.LessOrEqual(t, len(cond.Message), conditionMessageLimit)
+	require.Contains(t, cond.Message, "backend svc-000: ")
+	require.Contains(t, cond.Message, fmt.Sprintf("backend svc-%03d: ", maxReportedDenials-1))
+	require.NotContains(t, cond.Message, fmt.Sprintf("backend svc-%03d: ", maxReportedDenials))
+	require.Contains(t, cond.Message, fmt.Sprintf("%d more backends have a Secret reference that is not permitted", backends-maxReportedDenials))
+	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-000", false, "")
+	requirePerBackendResources(t, fakeClient, kubeClient, route, gwapiv1.ObjectName(fmt.Sprintf("svc-%03d", backends-1)), false, "")
 }
