@@ -326,37 +326,79 @@ func (c *MCPRouteController) deleteOrphanedPerBackendResources(ctx context.Conte
 // HTTPRouteFilter and credential Secret whose names derive from it. An object that does not exist is
 // not an error, so the call can be repeated and used for a backend that never had some of them; only
 // deletions that happened are logged.
+//
+// Derived names are not unique across MCPRoutes: route "a" with backend "b-c" and route "a-b" with
+// backend "c" share them. Each object is therefore read first and kept when another object controls
+// it, and deleted with a UID precondition so that a replacement created in between survives. Objects
+// without a controller reference are deleted: they are leftovers of a controller that stopped before
+// it finished.
 func (c *MCPRouteController) deletePerBackendResources(ctx context.Context, mcpRoute *aigv1b1.MCPRoute, httpRouteName string) error {
-	route := &gwapiv1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: httpRouteName, Namespace: mcpRoute.Namespace}}
-	if err := c.client.Delete(ctx, route); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete HTTPRoute %s: %w", httpRouteName, err)
-		}
-	} else {
-		c.logger.Info("Deleted per-backend HTTPRoute", "namespace", mcpRoute.Namespace, "name", httpRouteName)
+	if err := c.deleteControlledPerBackendObject(ctx, mcpRoute, "HTTPRoute", httpRouteName, &gwapiv1.HTTPRoute{}); err != nil {
+		return err
 	}
-
 	filterName := strings.Replace(httpRouteName, internalapi.MCPPerBackendRefHTTPRoutePrefix, internalapi.MCPPerBackendHTTPRouteFilterPrefix, 1)
-	filter := &egv1a1.HTTPRouteFilter{ObjectMeta: metav1.ObjectMeta{Name: filterName, Namespace: mcpRoute.Namespace}}
-	if err := c.client.Delete(ctx, filter); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete HTTPRouteFilter %s: %w", filterName, err)
-		}
-	} else {
-		c.logger.Info("Deleted per-backend HTTPRouteFilter", "namespace", mcpRoute.Namespace, "name", filterName)
+	if err := c.deleteControlledPerBackendObject(ctx, mcpRoute, "HTTPRouteFilter", filterName, &egv1a1.HTTPRouteFilter{}); err != nil {
+		return err
 	}
 
-	// Credential secrets are only created for backends with secretRef-based API keys, but we
-	// unconditionally attempt the delete to avoid an extra GET call.
+	// A credential Secret exists only for secretRef API keys and inline keys with injectionPolicy
+	// IfNotPresent. Secrets go through the clientset, as everywhere else in this controller.
 	credSecretName := internalapi.MCPPerBackendCredentialSecretPrefix + strings.TrimPrefix(httpRouteName, internalapi.MCPPerBackendRefHTTPRoutePrefix)
-	if err := c.kube.CoreV1().Secrets(mcpRoute.Namespace).Delete(ctx, credSecretName, metav1.DeleteOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete credential secret %s: %w", credSecretName, err)
-		}
-	} else {
+	secret, err := c.kube.CoreV1().Secrets(mcpRoute.Namespace).Get(ctx, credSecretName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return nil
+	case err != nil:
+		return fmt.Errorf("failed to get credential secret %s: %w", credSecretName, err)
+	case controlledByAnotherOwner(secret, mcpRoute):
+		c.logger.Info("Keeping credential secret controlled by another object", "namespace", mcpRoute.Namespace, "name", credSecretName)
+		return nil
+	}
+	err = c.kube.CoreV1().Secrets(mcpRoute.Namespace).Delete(ctx, credSecretName,
+		metav1.DeleteOptions{Preconditions: metav1.NewUIDPreconditions(string(secret.UID))})
+	switch {
+	case err == nil:
 		c.logger.Info("Deleted credential secret", "namespace", mcpRoute.Namespace, "name", credSecretName)
+	case apierrors.IsNotFound(err), apierrors.IsConflict(err):
+		// Gone in the meantime, or replaced by an object this reconcile has not seen: the next one judges it.
+	default:
+		return fmt.Errorf("failed to delete credential secret %s: %w", credSecretName, err)
 	}
 	return nil
+}
+
+// deleteControlledPerBackendObject deletes the object of the given kind and name in mcpRoute's namespace
+// unless it does not exist or another object controls it. See deletePerBackendResources.
+func (c *MCPRouteController) deleteControlledPerBackendObject(ctx context.Context, mcpRoute *aigv1b1.MCPRoute, kind, name string, obj client.Object) error {
+	if err := c.client.Get(ctx, client.ObjectKey{Name: name, Namespace: mcpRoute.Namespace}, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get %s %s: %w", kind, name, err)
+	}
+	if controlledByAnotherOwner(obj, mcpRoute) {
+		c.logger.Info("Keeping per-backend object controlled by another object", "kind", kind, "namespace", mcpRoute.Namespace, "name", name)
+		return nil
+	}
+	err := c.client.Delete(ctx, obj, client.Preconditions{UID: ptr.To(obj.GetUID())})
+	switch {
+	case err == nil:
+		c.logger.Info("Deleted per-backend object", "kind", kind, "namespace", mcpRoute.Namespace, "name", name)
+	case apierrors.IsNotFound(err), apierrors.IsConflict(err):
+		// Gone in the meantime, or replaced by an object this reconcile has not seen: the next one judges it.
+	default:
+		return fmt.Errorf("failed to delete %s %s: %w", kind, name, err)
+	}
+	return nil
+}
+
+// controlledByAnotherOwner reports whether obj has a controller reference to anything but mcpRoute. Like
+// the owned-HTTPRoute index (httpRouteToOwnerMCPRouteIndexFunc), it compares the owner's kind and name
+// rather than its UID, so an object left behind by an earlier MCPRoute of the same name counts as the
+// route's own.
+func controlledByAnotherOwner(obj metav1.Object, mcpRoute *aigv1b1.MCPRoute) bool {
+	owner := metav1.GetControllerOf(obj)
+	return owner != nil && (owner.Kind != "MCPRoute" || owner.Name != mcpRoute.Name)
 }
 
 // newMainHTTPRoute updates the main HTTPRoute with the MCPRoute.

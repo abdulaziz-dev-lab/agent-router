@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwapiv1b1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -2024,4 +2025,94 @@ func TestMCPRouteController_Reconcile_DeniedRouteDeleted(t *testing.T) {
 	require.True(t, apierrors.IsNotFound(fakeClient.Get(t.Context(), req.NamespacedName, &current)))
 	var sharedBackend egv1a1.Backend
 	require.True(t, apierrors.IsNotFound(fakeClient.Get(t.Context(), client.ObjectKey{Name: mcpProxySharedBackendName, Namespace: "default"}, &sharedBackend)))
+}
+
+// TestMCPRouteController_Reconcile_DeniedBackendKeepsCollidingRouteObjects verifies that a denied
+// backend whose derived object names collide with another MCPRoute's backend leaves that route's
+// objects alone: route "github-mcp" with backend "prod" and route "github" with backend "mcp-prod"
+// both derive "<prefix>github-mcp-prod".
+func TestMCPRouteController_Reconcile_DeniedBackendKeepsCollidingRouteObjects(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexesForMCP(t)
+	kubeClient := fakekube.NewClientset(
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token-a", Namespace: "default"}, Data: map[string][]byte{"apiKey": []byte("a-value")}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token-b", Namespace: "shared"}, Data: map[string][]byte{"apiKey": []byte("b-value")}},
+	)
+	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+	c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), eventCh.Ch)
+	require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}}))
+	newRoute := func(name string, backend aigv1b1.MCPRouteBackendRef) *aigv1b1.MCPRoute {
+		return &aigv1b1.MCPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       aigv1b1.MCPRouteSpec{ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}}, BackendRefs: []aigv1b1.MCPRouteBackendRef{backend}},
+		}
+	}
+	first := newRoute("github-mcp", mcpRouteSecretRefBackend("prod", "default", "", "token-a"))
+	second := newRoute("github", mcpRouteSecretRefBackend("mcp-prod", "default", "shared", "token-b"))
+	require.Equal(t, mcpPerBackendRefHTTPRouteName(first.Name, "prod"), mcpPerBackendRefHTTPRouteName(second.Name, "mcp-prod"))
+	require.NoError(t, fakeClient.Create(t.Context(), first))
+	require.NoError(t, fakeClient.Create(t.Context(), second))
+
+	_, err := c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(first)})
+	require.NoError(t, err)
+	requirePerBackendResources(t, fakeClient, kubeClient, first, "prod", true, "Bearer a-value")
+
+	// The second route's backend is denied on every reconcile, and every reconcile must leave the first
+	// route's HTTPRoute, HTTPRouteFilter and credential Secret in place.
+	for range 2 {
+		_, err = c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(second)})
+		require.ErrorContains(t, err, "backend mcp-prod: cross-namespace reference from MCPRoute in namespace default to Secret token-b in namespace shared is not permitted")
+		requirePerBackendResources(t, fakeClient, kubeClient, first, "prod", true, "Bearer a-value")
+	}
+	requireMCPRouteCondition(t, fakeClient, second, aigv1b1.ConditionTypeNotAccepted, "backend mcp-prod: ")
+}
+
+// TestMCPRouteController_deletePerBackendResources verifies which objects the per-backend cleanup
+// removes: those the MCPRoute controls and those without a controller reference, never those another
+// object controls.
+func TestMCPRouteController_deletePerBackendResources(t *testing.T) {
+	route := &aigv1b1.MCPRoute{ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default", UID: "uid-a"}}
+	tests := []struct {
+		name string
+		// owner becomes the controller of the three objects; nil leaves them without one.
+		owner      *aigv1b1.MCPRoute
+		expDeleted bool
+	}{
+		{name: "controlled by the route", owner: route, expDeleted: true},
+		{name: "no controller reference", expDeleted: true},
+		{name: "controlled by another route", owner: &aigv1b1.MCPRoute{ObjectMeta: metav1.ObjectMeta{Name: "route-b", Namespace: "default", UID: "uid-b"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := requireNewFakeClientWithIndexesForMCP(t)
+			kubeClient := fakekube.NewClientset()
+			c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), internaltesting.NewControllerEventChan[*gwapiv1.Gateway]().Ch)
+			httpRouteName := mcpPerBackendRefHTTPRouteName(route.Name, "svc")
+			httpRoute := &gwapiv1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: httpRouteName, Namespace: route.Namespace}}
+			filter := &egv1a1.HTTPRouteFilter{ObjectMeta: metav1.ObjectMeta{Name: mcpBackendRefFilterName(route, "svc"), Namespace: route.Namespace}}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: mcpCredentialSecretName(route, "svc"), Namespace: route.Namespace}}
+			if tt.owner != nil {
+				for _, obj := range []metav1.Object{httpRoute, filter, secret} {
+					require.NoError(t, ctrlutil.SetControllerReference(tt.owner, obj, fakeClient.Scheme()))
+				}
+			}
+			require.NoError(t, fakeClient.Create(t.Context(), httpRoute))
+			require.NoError(t, fakeClient.Create(t.Context(), filter))
+			_, err := kubeClient.CoreV1().Secrets(route.Namespace).Create(t.Context(), secret, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			require.NoError(t, c.deletePerBackendResources(t.Context(), route, httpRouteName))
+			routeErr := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(httpRoute), &gwapiv1.HTTPRoute{})
+			filterErr := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(filter), &egv1a1.HTTPRouteFilter{})
+			_, secretErr := kubeClient.CoreV1().Secrets(route.Namespace).Get(t.Context(), secret.Name, metav1.GetOptions{})
+			for _, getErr := range []error{routeErr, filterErr, secretErr} {
+				if tt.expDeleted {
+					require.Truef(t, apierrors.IsNotFound(getErr), "the object must be deleted, got %v", getErr)
+				} else {
+					require.NoError(t, getErr, "an object controlled by another route must be kept")
+				}
+			}
+			// Repeating the call changes nothing.
+			require.NoError(t, c.deletePerBackendResources(t.Context(), route, httpRouteName))
+		})
+	}
 }
