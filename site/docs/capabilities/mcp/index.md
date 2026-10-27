@@ -161,7 +161,7 @@ spec:
 
 The `name` field limits the grant to that one Secret. Without it, the grant covers every Secret in the namespace. To allow several Secrets, add a `to` entry for each.
 
-The controller copies the referenced value into a managed Secret in the MCPRoute's namespace, and into the generated HTTPRoute when the key is sent as a query parameter, so anyone who can read Secrets or HTTPRoutes in that namespace can read it. Deleting the referenced Secret leaves the last copied value in place; remove the grant to cut access. A controller started with `--watchNamespaces` (Helm: `controller.watch.namespaces`) must watch the Secret's namespace as well, or it cannot see the ReferenceGrant and the MCPRoute stays `NotAccepted`.
+The controller copies the referenced value into a managed Secret in the MCPRoute's namespace (header injection) or into the generated HTTPRoute (query parameter), so anyone who can read Secrets or HTTPRoutes in that namespace can read it. The controller does not watch for the deletion of the referenced Secret: the last copied value stays in place until the route's next reconcile, which then fails; remove the grant to cut access. A controller started with `--watchNamespaces` (Helm: `controller.watch.namespaces`) must watch the Secret's namespace as well; otherwise it cannot see the ReferenceGrant and the MCPRoute is `NotAccepted` with an error that names the unwatched namespace.
 
 With `aigw run`, put the ReferenceGrant in the configuration file.
 
