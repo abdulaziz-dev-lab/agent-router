@@ -1863,8 +1863,10 @@ func TestMCPRouteController_Reconcile_SecretRefGrantRevokedAfterFailingBackend(t
 	require.NoError(t, fakeClient.Delete(t.Context(), grant))
 	_, err = c.Reconcile(t.Context(), req)
 	require.ErrorContains(t, err, `failed to get secret for API key: secrets "broken-secret" not found`)
-	require.ErrorContains(t, err, "backend svc-revoked: cross-namespace reference from MCPRoute in namespace default to Secret some-secret in namespace shared is not permitted")
-	requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeNotAccepted, `secrets "broken-secret" not found`, "backend svc-revoked: ")
+	require.ErrorContains(t, err, notPermittedMessage("svc-revoked", "default", "some-secret", "shared"))
+	var notPermitted *ReferenceNotPermittedError
+	require.ErrorAs(t, err, &notPermitted, "the joined error must still unwrap to the denial")
+	requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeNotAccepted, `secrets "broken-secret" not found`, notPermittedMessage("svc-revoked", "default", "some-secret", "shared"))
 	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-revoked", false, "")
 	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-broken", true, "Bearer broken-value")
 }
