@@ -2265,3 +2265,55 @@ func TestMCPRouteController_Reconcile_ManyDenialsFitTheStatus(t *testing.T) {
 	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-000", false, "")
 	requirePerBackendResources(t, fakeClient, kubeClient, route, gwapiv1.ObjectName(fmt.Sprintf("svc-%03d", backends-1)), false, "")
 }
+
+// TestMCPRouteController_Reconcile_SweepErrorKeepsEarlierDenials verifies that when the revocation
+// sweep fails on a later backend, the denials it already acted on stay in the error and the status:
+// their objects are gone, so the status must say why.
+func TestMCPRouteController_Reconcile_SweepErrorKeepsEarlierDenials(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexesForMCP(t)
+	kubeClient := fakekube.NewClientset(
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "some-secret", Namespace: "shared"}, Data: map[string][]byte{"apiKey": []byte("shared-value")}},
+	)
+	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+	c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), eventCh.Ch)
+	require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}}))
+	route := &aigv1b1.MCPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default"},
+		Spec: aigv1b1.MCPRouteSpec{
+			ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}},
+			BackendRefs: []aigv1b1.MCPRouteBackendRef{
+				mcpRouteSecretRefBackend("svc-a", "default", "shared", "some-secret"),
+				mcpRouteSecretRefBackend("svc-b", "default", "shared", "some-secret"),
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), route))
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(route)}
+	grant := mcpRouteSecretGrant("shared", "default", "")
+	require.NoError(t, fakeClient.Create(t.Context(), grant))
+	_, err := c.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	// The grant goes and svc-b's credential Secret cannot be deleted for a while.
+	failing := true
+	credB := mcpCredentialSecretName(route, "svc-b")
+	kubeClient.PrependReactor("delete", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if del, ok := a.(k8stesting.DeleteAction); ok && failing && del.GetName() == credB {
+			return true, nil, apierrors.NewInternalError(errors.New("apiserver unavailable"))
+		}
+		return false, nil, nil
+	})
+	require.NoError(t, fakeClient.Delete(t.Context(), grant))
+	_, err = c.Reconcile(t.Context(), req)
+	deniedA := notPermittedMessage("svc-a", "default", "some-secret", "shared")
+	require.ErrorContains(t, err, "failed to delete the resources of backend svc-b")
+	require.ErrorContains(t, err, deniedA)
+	requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeNotAccepted, "failed to delete the resources of backend svc-b", deniedA)
+	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-a", false, "")
+
+	failing = false
+	_, err = c.Reconcile(t.Context(), req)
+	require.ErrorContains(t, err, deniedA)
+	require.ErrorContains(t, err, notPermittedMessage("svc-b", "default", "some-secret", "shared"))
+	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-b", false, "")
+}

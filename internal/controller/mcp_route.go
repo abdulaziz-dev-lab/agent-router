@@ -104,7 +104,7 @@ func (c *MCPRouteController) syncMCPRoute(ctx context.Context, mcpRoute *aigv1b1
 	// steps: the denied backends' objects are already gone, and the status must say why.
 	denied, err := c.revokeDeniedSecretRefs(ctx, mcpRoute)
 	if err != nil {
-		return err
+		return errors.Join(err, denied.err)
 	}
 	return errors.Join(c.syncMCPRouteResources(ctx, mcpRoute, denied), denied.err)
 }
@@ -215,7 +215,8 @@ func (d deniedSecretRefs) has(httpRouteName string) bool {
 // namespace that no ReferenceGrant allows to the never-granted state: the per-backend HTTPRoute,
 // HTTPRouteFilter and credential Secret generated while a grant existed are deleted, so a revoked or
 // narrowed grant stops the data plane from injecting the copied credential. Any error other than a
-// denial aborts the sync so the next reconcile retries.
+// denial aborts the sync so the next reconcile retries; the denials recorded before it are returned
+// with the error, because those backends' objects are already gone and the status must say why.
 //
 // This runs before the per-backend loop on purpose: that loop stops at its first error, so a backend
 // with an unrelated persistent error earlier in the spec must not keep a later backend's revoked
@@ -239,11 +240,13 @@ func (c *MCPRouteController) revokeDeniedSecretRefs(ctx context.Context, mcpRout
 		}
 		var notPermitted *ReferenceNotPermittedError
 		if !errors.As(err, &notPermitted) {
-			return deniedSecretRefs{}, fmt.Errorf("failed to validate the Secret reference of backend %s: %w", ref.Name, err)
+			denied.err = joinDenials(denials)
+			return denied, fmt.Errorf("failed to validate the Secret reference of backend %s: %w", ref.Name, err)
 		}
 		name := mcpPerBackendRefHTTPRouteName(mcpRoute.Name, ref.Name)
 		if err = c.deletePerBackendResources(ctx, mcpRoute, name); err != nil {
-			return deniedSecretRefs{}, fmt.Errorf("failed to delete the resources of backend %s: %w", ref.Name, err)
+			denied.err = joinDenials(denials)
+			return denied, fmt.Errorf("failed to delete the resources of backend %s: %w", ref.Name, err)
 		}
 		denied.httpRouteNames[name] = struct{}{}
 		denials = append(denials, fmt.Errorf("backend %s: %w", ref.Name, notPermitted))
