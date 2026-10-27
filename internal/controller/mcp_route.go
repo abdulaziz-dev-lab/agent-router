@@ -224,6 +224,7 @@ func (d deniedSecretRefs) has(httpRouteName string) bool {
 func (c *MCPRouteController) revokeDeniedSecretRefs(ctx context.Context, mcpRoute *aigv1b1.MCPRoute) (deniedSecretRefs, error) {
 	denied := deniedSecretRefs{httpRouteNames: make(map[string]struct{})}
 	var denials []error
+	omitted := 0
 	for i := range mcpRoute.Spec.BackendRefs {
 		ref := &mcpRoute.Spec.BackendRefs[i]
 		if ref.SecurityPolicy == nil || ref.SecurityPolicy.APIKey == nil {
@@ -240,32 +241,39 @@ func (c *MCPRouteController) revokeDeniedSecretRefs(ctx context.Context, mcpRout
 		}
 		var notPermitted *ReferenceNotPermittedError
 		if !errors.As(err, &notPermitted) {
-			denied.err = joinDenials(denials)
+			denied.err = joinDenials(denials, omitted)
 			return denied, fmt.Errorf("failed to validate the Secret reference of backend %s: %w", ref.Name, err)
 		}
 		name := mcpPerBackendRefHTTPRouteName(mcpRoute.Name, ref.Name)
 		if err = c.deletePerBackendResources(ctx, mcpRoute, name); err != nil {
-			denied.err = joinDenials(denials)
+			denied.err = joinDenials(denials, omitted)
 			return denied, fmt.Errorf("failed to delete the resources of backend %s: %w", ref.Name, err)
 		}
 		denied.httpRouteNames[name] = struct{}{}
-		denials = append(denials, fmt.Errorf("backend %s: %w", ref.Name, notPermitted))
+		if len(denials) <= maxReportedDenials {
+			denials = append(denials, fmt.Errorf("backend %s: %w", ref.Name, notPermitted))
+		} else {
+			omitted++
+		}
 	}
-	denied.err = joinDenials(denials)
+	denied.err = joinDenials(denials, omitted)
 	return denied, nil
 }
 
 // maxReportedDenials bounds the denials listed in the status: the CRD caps a condition message at 32768
-// bytes, one denial takes up to about 1 KiB with maximum-length names, and a route has up to 256
+// characters, one denial takes up to about 1 KiB with maximum-length names, and a route has up to 256
 // backends.
 const maxReportedDenials = 10
 
-// joinDenials joins the per-backend denials in spec order, listing at most maxReportedDenials of them
-// and counting the rest.
-func joinDenials(denials []error) error {
-	if n := len(denials); n > maxReportedDenials {
+// joinDenials joins the recorded denials in spec order. The sweep records up to maxReportedDenials+1 of
+// them and counts the rest as omitted; when any was omitted the status lists the first
+// maxReportedDenials and counts the others, so the count line always stands for at least two backends
+// and a route with exactly maxReportedDenials+1 denials lists them all.
+func joinDenials(denials []error, omitted int) error {
+	if omitted > 0 {
+		hidden := len(denials) - maxReportedDenials + omitted
 		denials = append(denials[:maxReportedDenials:maxReportedDenials],
-			fmt.Errorf("%d more backends have a Secret reference that is not permitted", n-maxReportedDenials))
+			fmt.Errorf("%d more backends have a Secret reference that is not permitted", hidden))
 	}
 	return errors.Join(denials...)
 }
