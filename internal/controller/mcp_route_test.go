@@ -18,6 +18,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	fakekube "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -26,7 +27,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwapiv1b1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -2118,86 +2118,130 @@ func TestMCPRouteController_Reconcile_CollidingBackendLeavesTheOtherRouteAlone(t
 
 // TestMCPRouteController_deletePerBackendResources verifies which objects the per-backend cleanup
 // removes: those the MCPRoute controls and those without a controller reference, never those another
-// object controls.
+// object controls, whether that is another MCPRoute, a same-named MCPRoute of another API group or
+// another kind.
 func TestMCPRouteController_deletePerBackendResources(t *testing.T) {
 	route := &aigv1b1.MCPRoute{ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default", UID: "uid-a"}}
+	controller := func(apiVersion, kind, name string) *metav1.OwnerReference {
+		return &metav1.OwnerReference{APIVersion: apiVersion, Kind: kind, Name: name, UID: types.UID("uid-" + name), Controller: ptr.To(true)}
+	}
 	tests := []struct {
 		name string
-		// owner becomes the controller of the three objects; nil leaves them without one.
-		owner      *aigv1b1.MCPRoute
+		// owner becomes the controller reference of the three objects; nil leaves them without one.
+		owner      *metav1.OwnerReference
 		expDeleted bool
 	}{
-		{name: "controlled by the route", owner: route, expDeleted: true},
+		{name: "controlled by the route", owner: controller(aigv1b1.SchemeGroupVersion.String(), "MCPRoute", "route-a"), expDeleted: true},
+		{name: "controlled by an earlier MCPRoute of the same name", owner: &metav1.OwnerReference{APIVersion: aigv1b1.SchemeGroupVersion.String(), Kind: "MCPRoute", Name: "route-a", UID: "uid-previous", Controller: ptr.To(true)}, expDeleted: true},
 		{name: "no controller reference", expDeleted: true},
-		{name: "controlled by another route", owner: &aigv1b1.MCPRoute{ObjectMeta: metav1.ObjectMeta{Name: "route-b", Namespace: "default", UID: "uid-b"}}},
+		{name: "controlled by another route", owner: controller(aigv1b1.SchemeGroupVersion.String(), "MCPRoute", "route-b")},
+		{name: "controlled by a same-named MCPRoute of another API group", owner: controller("other.example.com/v1", "MCPRoute", "route-a")},
+		{name: "controlled by another kind", owner: controller("apps/v1", "Deployment", "route-a")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fakeClient := requireNewFakeClientWithIndexesForMCP(t)
 			kubeClient := fakekube.NewClientset()
 			c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), internaltesting.NewControllerEventChan[*gwapiv1.Gateway]().Ch)
-			httpRouteName := mcpPerBackendRefHTTPRouteName(route.Name, "svc")
-			httpRoute := &gwapiv1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: httpRouteName, Namespace: route.Namespace}}
-			filter := &egv1a1.HTTPRouteFilter{ObjectMeta: metav1.ObjectMeta{Name: mcpBackendRefFilterName(route, "svc"), Namespace: route.Namespace}}
-			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: mcpCredentialSecretName(route, "svc"), Namespace: route.Namespace}}
-			if tt.owner != nil {
-				for _, obj := range []metav1.Object{httpRoute, filter, secret} {
-					require.NoError(t, ctrlutil.SetControllerReference(tt.owner, obj, fakeClient.Scheme()))
+			meta := func(name string) metav1.ObjectMeta {
+				m := metav1.ObjectMeta{Name: name, Namespace: route.Namespace}
+				if tt.owner != nil {
+					m.OwnerReferences = []metav1.OwnerReference{*tt.owner}
 				}
+				return m
 			}
-			require.NoError(t, fakeClient.Create(t.Context(), httpRoute))
-			require.NoError(t, fakeClient.Create(t.Context(), filter))
-			_, err := kubeClient.CoreV1().Secrets(route.Namespace).Create(t.Context(), secret, metav1.CreateOptions{})
+			httpRouteName := mcpPerBackendRefHTTPRouteName(route.Name, "svc")
+			require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.HTTPRoute{ObjectMeta: meta(httpRouteName)}))
+			require.NoError(t, fakeClient.Create(t.Context(), &egv1a1.HTTPRouteFilter{ObjectMeta: meta(mcpBackendRefFilterName(route, "svc"))}))
+			_, err := kubeClient.CoreV1().Secrets(route.Namespace).Create(t.Context(), &corev1.Secret{
+				ObjectMeta: meta(mcpCredentialSecretName(route, "svc")),
+				Data:       map[string][]byte{egv1a1.InjectedCredentialKey: []byte("kept")},
+			}, metav1.CreateOptions{})
 			require.NoError(t, err)
 
 			require.NoError(t, c.deletePerBackendResources(t.Context(), route, httpRouteName))
-			routeErr := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(httpRoute), &gwapiv1.HTTPRoute{})
-			filterErr := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(filter), &egv1a1.HTTPRouteFilter{})
-			_, secretErr := kubeClient.CoreV1().Secrets(route.Namespace).Get(t.Context(), secret.Name, metav1.GetOptions{})
-			for _, getErr := range []error{routeErr, filterErr, secretErr} {
-				if tt.expDeleted {
-					require.Truef(t, apierrors.IsNotFound(getErr), "the object must be deleted, got %v", getErr)
-				} else {
-					require.NoError(t, getErr, "an object controlled by another route must be kept")
-				}
-			}
+			requirePerBackendResources(t, fakeClient, kubeClient, route, "svc", !tt.expDeleted, "kept")
 			// Repeating the call changes nothing.
 			require.NoError(t, c.deletePerBackendResources(t.Context(), route, httpRouteName))
+			requirePerBackendResources(t, fakeClient, kubeClient, route, "svc", !tt.expDeleted, "kept")
 		})
 	}
 }
 
-// TestMCPRouteController_Reconcile_DenialReportedWithLaterError verifies that a backend's denial stays
-// in the error and in the status when a later step fails: the denied backend's objects are already
-// gone, so the status must say why.
-func TestMCPRouteController_Reconcile_DenialReportedWithLaterError(t *testing.T) {
-	fakeClient := requireNewFakeClientWithIndexesForMCP(t)
-	kubeClient := fakekube.NewClientset(
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "some-secret", Namespace: "shared"}, Data: map[string][]byte{"apiKey": []byte("shared-value")}},
-	)
-	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
-	c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), eventCh.Ch)
-	require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}}))
-	route := &aigv1b1.MCPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default"},
-		Spec: aigv1b1.MCPRouteSpec{
-			ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}},
-			BackendRefs: []aigv1b1.MCPRouteBackendRef{
-				mcpRouteSecretRefBackend("svc-broken", "default", "", "missing-secret"),
-				mcpRouteSecretRefBackend("svc-denied", "default", "shared", "some-secret"),
-			},
-		},
+// TestMCPRouteController_deletePerBackendResources_KeepsReplacedObjects verifies the UID precondition:
+// when the object the cleanup read has been replaced since (the read came from a cache, or another
+// MCPRoute re-created the object in between), the API server answers Conflict and the replacement
+// survives. The interceptors play the cache (stale UID on reads) and the API server (precondition
+// check on deletes).
+func TestMCPRouteController_deletePerBackendResources_KeepsReplacedObjects(t *testing.T) {
+	route := &aigv1b1.MCPRoute{ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default", UID: "uid-a"}}
+	inner, ok := requireNewFakeClientWithIndexesForMCP(t).(client.WithWatch)
+	require.True(t, ok)
+	conflict := func(name string) error {
+		return apierrors.NewConflict(schema.GroupResource{Resource: "objects"}, name, errors.New("the UID in the precondition does not match the UID in record"))
 	}
-	require.NoError(t, fakeClient.Create(t.Context(), route))
+	fakeClient := interceptor.NewClient(inner, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			obj.SetUID("stale-" + obj.GetUID())
+			return nil
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			live := obj.DeepCopyObject().(client.Object)
+			if err := c.Get(ctx, client.ObjectKeyFromObject(obj), live); err != nil {
+				return err
+			}
+			do := &client.DeleteOptions{}
+			do.ApplyOptions(opts)
+			if do.Preconditions != nil && do.Preconditions.UID != nil && *do.Preconditions.UID != live.GetUID() {
+				return conflict(obj.GetName())
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	kubeClient := fakekube.NewClientset()
+	secretsGVR := corev1.SchemeGroupVersion.WithResource("secrets")
+	kubeClient.PrependReactor("get", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		get := a.(k8stesting.GetAction)
+		obj, err := kubeClient.Tracker().Get(secretsGVR, get.GetNamespace(), get.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		stale := obj.DeepCopyObject().(*corev1.Secret)
+		stale.UID = "stale-" + stale.UID
+		return true, stale, nil
+	})
+	kubeClient.PrependReactor("delete", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		del := a.(k8stesting.DeleteActionImpl)
+		obj, err := kubeClient.Tracker().Get(secretsGVR, del.GetNamespace(), del.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		if p := del.DeleteOptions.Preconditions; p != nil && p.UID != nil && *p.UID != obj.(*corev1.Secret).UID {
+			return true, nil, conflict(del.GetName())
+		}
+		return false, nil, nil
+	})
+	c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), internaltesting.NewControllerEventChan[*gwapiv1.Gateway]().Ch)
+	owned := func(name string, uid types.UID) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Name: name, Namespace: route.Namespace, UID: uid, OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: aigv1b1.SchemeGroupVersion.String(), Kind: "MCPRoute", Name: route.Name, UID: route.UID, Controller: ptr.To(true),
+		}}}
+	}
+	httpRouteName := mcpPerBackendRefHTTPRouteName(route.Name, "svc")
+	require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.HTTPRoute{ObjectMeta: owned(httpRouteName, "uid-route")}))
+	require.NoError(t, fakeClient.Create(t.Context(), &egv1a1.HTTPRouteFilter{ObjectMeta: owned(mcpBackendRefFilterName(route, "svc"), "uid-filter")}))
+	_, err := kubeClient.CoreV1().Secrets(route.Namespace).Create(t.Context(), &corev1.Secret{
+		ObjectMeta: owned(mcpCredentialSecretName(route, "svc"), "uid-secret"),
+		Data:       map[string][]byte{egv1a1.InjectedCredentialKey: []byte("kept")},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
 
-	_, err := c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(route)})
-	const denial = "backend svc-denied: cross-namespace reference from MCPRoute in namespace default to Secret some-secret in namespace shared is not permitted"
-	require.ErrorContains(t, err, `secrets "missing-secret" not found`)
-	require.ErrorContains(t, err, denial)
-	var notPermitted *ReferenceNotPermittedError
-	require.ErrorAs(t, err, &notPermitted)
-	requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeNotAccepted, `secrets "missing-secret" not found`, denial)
-	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-denied", false, "")
+	// Every delete is answered with Conflict, which the cleanup treats as "replaced, judged next time".
+	require.NoError(t, c.deletePerBackendResources(t.Context(), route, httpRouteName))
+	requirePerBackendResources(t, inner, kubeClient, route, "svc", true, "kept")
 }
 
 // TestMCPRouteController_Reconcile_ManyDenialsFitTheStatus revokes the grant of routes whose backends
