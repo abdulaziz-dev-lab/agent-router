@@ -2366,3 +2366,33 @@ func TestMCPRouteController_Reconcile_SweepErrorKeepsEarlierDenials(t *testing.T
 	require.ErrorContains(t, err, notPermittedMessage("svc-b", "default", "some-secret", "shared"))
 	requirePerBackendResources(t, fakeClient, kubeClient, route, "svc-b", false, "")
 }
+
+// TestMCPRouteController_Reconcile_EmptyInlineKey verifies that an empty inline key, which the CRD
+// admits, is reported as an error on the paths that would otherwise read a Secret (injectionPolicy
+// IfNotPresent and queryParam) instead of dereferencing the missing secretRef.
+func TestMCPRouteController_Reconcile_EmptyInlineKey(t *testing.T) {
+	for name, apiKey := range map[string]*aigv1b1.MCPBackendAPIKey{
+		"injectionPolicy IfNotPresent": {Inline: ptr.To(""), InjectionPolicy: ptr.To(aigv1b1.MCPBackendAPIKeyInjectionIfNotPresent)},
+		"queryParam":                   {Inline: ptr.To(""), QueryParam: ptr.To("api_key")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fakeClient := requireNewFakeClientWithIndexesForMCP(t)
+			c := NewMCPRouteController(fakeClient, fakekube.NewClientset(), logr.Discard(), internaltesting.NewControllerEventChan[*gwapiv1.Gateway]().Ch)
+			require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}}))
+			route := &aigv1b1.MCPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default"},
+				Spec: aigv1b1.MCPRouteSpec{
+					ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}},
+					BackendRefs: []aigv1b1.MCPRouteBackendRef{{
+						BackendObjectReference: gwapiv1.BackendObjectReference{Name: "svc-a", Namespace: ptr.To(gwapiv1.Namespace("default"))},
+						SecurityPolicy:         &aigv1b1.MCPBackendSecurityPolicy{APIKey: apiKey},
+					}},
+				},
+			}
+			require.NoError(t, fakeClient.Create(t.Context(), route))
+			_, err := c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(route)})
+			require.ErrorContains(t, err, "apiKey has neither a non-empty inline value nor a secretRef")
+			requireMCPRouteCondition(t, fakeClient, route, aigv1b1.ConditionTypeNotAccepted, "neither a non-empty inline value nor a secretRef")
+		})
+	}
+}

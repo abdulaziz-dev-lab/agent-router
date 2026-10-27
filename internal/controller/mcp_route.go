@@ -1119,6 +1119,10 @@ func (c *MCPRouteController) readAPIKey(ctx context.Context, mcpRoute *aigv1b1.M
 	key := ptr.Deref(apiKey.Inline, "")
 	if key == "" {
 		secretRef := apiKey.SecretRef
+		if secretRef == nil {
+			// The CRD requires exactly one of inline and secretRef but admits an empty inline value.
+			return "", errors.New("apiKey has neither a non-empty inline value nor a secretRef")
+		}
 		namespace := resolveAPIKeySecretNamespace(mcpRoute, secretRef)
 		// The grant check must run before the Secret is read: the controller can read every Secret
 		// in the cluster, so an ungranted reference must never reach the API server.
