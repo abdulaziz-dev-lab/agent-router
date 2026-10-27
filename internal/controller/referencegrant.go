@@ -212,7 +212,11 @@ func (v *referenceGrantValidator) validateReference(
 
 	indexKey := getReferenceGrantIndexKey(targetNamespace, string(targetKind))
 	var referenceGrants gwapiv1b1.ReferenceGrantList
+	// The index key already names the namespace; listing in that namespace as well makes a cache that
+	// does not watch it (--watchNamespaces) return an error instead of an empty list, so a grant the
+	// controller cannot see is reported as such rather than as a denial.
 	if err := v.client.List(ctx, &referenceGrants,
+		client.InNamespace(targetNamespace),
 		client.MatchingFields{k8sClientIndexReferenceGrantToTargetKind: indexKey},
 	); err != nil {
 		return fmt.Errorf("failed to list ReferenceGrants in namespace %s for kind %s: %w",

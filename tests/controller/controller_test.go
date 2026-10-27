@@ -35,6 +35,7 @@ import (
 	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 	gwaiev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -974,4 +975,79 @@ func TestMCPRouteController_ReferenceGrantRevocation(t *testing.T) {
 		require.NoError(t, c.Create(t.Context(), newGrant()))
 		requireState(t, aigv1b1.ConditionTypeAccepted, "", true)
 	})
+}
+
+// TestMCPRouteController_UnwatchedGrantNamespaceIsAnError runs the MCPRoute controller on a cache that
+// watches only the route's namespace (as --watchNamespaces does) and references a Secret in a namespace
+// the cache does not cover. The controller cannot see the ReferenceGrant there; it must report that as an
+// error and not as a denial, because a denial deletes the backend's generated objects.
+func TestMCPRouteController_UnwatchedGrantNamespaceIsAnError(t *testing.T) {
+	c, cfg, k := testsinternal.NewEnvTest(t)
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:         c.Scheme(),
+		LeaderElection: false,
+		Metrics:        metricsserver.Options{BindAddress: "0"},
+		Controller:     config.Controller{SkipNameValidation: ptr.To(true)},
+		Cache:          cache.Options{DefaultNamespaces: map[string]cache.Config{"default": {}}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, controller.ApplyIndexing(t.Context(), mgr.GetFieldIndexer().IndexField))
+	gatewayCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+	require.NoError(t, controller.TypedControllerBuilderForCRD(mgr, &aigv1b1.MCPRoute{}).
+		Owns(&gwapiv1.HTTPRoute{}).
+		Complete(controller.NewMCPRouteController(mgr.GetClient(), k, defaultLogger(), gatewayCh.Ch)))
+	go func() {
+		for {
+			select {
+			case <-t.Context().Done():
+				return
+			case <-gatewayCh.Ch:
+			}
+		}
+	}()
+	require.NoError(t, c.Create(t.Context(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "unwatched"}}))
+	require.NoError(t, c.Create(t.Context(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "some-secret", Namespace: "unwatched"},
+		StringData: map[string]string{"apiKey": "value"},
+	}))
+	require.NoError(t, c.Create(t.Context(), &gwapiv1b1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{Name: "allow-mcproutes", Namespace: "unwatched"},
+		Spec: gwapiv1b1.ReferenceGrantSpec{
+			From: []gwapiv1b1.ReferenceGrantFrom{{Group: "aigateway.envoyproxy.io", Kind: "MCPRoute", Namespace: "default"}},
+			To:   []gwapiv1b1.ReferenceGrantTo{{Group: "", Kind: "Secret"}},
+		},
+	}))
+	require.NoError(t, c.Create(t.Context(), &gwapiv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gwapiv1.GatewaySpec{
+			GatewayClassName: "gwclass",
+			Listeners:        []gwapiv1.Listener{{Name: "listener1", Port: 8080, Protocol: "http"}},
+		},
+	}))
+	go func() { require.NoError(t, mgr.Start(t.Context())) }()
+	require.True(t, mgr.GetCache().WaitForCacheSync(t.Context()))
+
+	route := &aigv1b1.MCPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: aigv1b1.MCPRouteSpec{
+			ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}},
+			BackendRefs: []aigv1b1.MCPRouteBackendRef{{
+				BackendObjectReference: gwapiv1.BackendObjectReference{Name: "svc", Port: ptr.To(gwapiv1.PortNumber(80))},
+				SecurityPolicy: &aigv1b1.MCPBackendSecurityPolicy{APIKey: &aigv1b1.MCPBackendAPIKey{
+					SecretRef: &gwapiv1.SecretObjectReference{Name: "some-secret", Namespace: ptr.To(gwapiv1.Namespace("unwatched"))},
+				}},
+			}},
+		},
+	}
+	require.NoError(t, c.Create(t.Context(), route))
+	require.Eventually(t, func() bool {
+		var current aigv1b1.MCPRoute
+		if err := c.Get(t.Context(), client.ObjectKeyFromObject(route), &current); err != nil || len(current.Status.Conditions) != 1 {
+			return false
+		}
+		cond := current.Status.Conditions[0]
+		t.Logf("condition %s: %s", cond.Type, cond.Message)
+		return cond.Type == aigv1b1.ConditionTypeNotAccepted && strings.Contains(cond.Message, "unknown namespace for the cache") &&
+			!strings.Contains(cond.Message, "is not permitted")
+	}, 30*time.Second, 200*time.Millisecond)
 }
