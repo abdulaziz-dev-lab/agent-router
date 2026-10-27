@@ -364,9 +364,10 @@ func (c *MCPRouteController) deleteOrphanedPerBackendResources(ctx context.Conte
 //
 // Derived names are not unique across MCPRoutes: route "a" with backend "b-c" and route "a-b" with
 // backend "c" share them. Each object is therefore read first and kept when another object controls
-// it, and deleted with a UID precondition so that a replacement created in between survives. Objects
-// without a controller reference are deleted: they are leftovers of a controller that stopped before
-// it finished.
+// it, and deleted with a UID precondition so that a replacement created in between survives. The
+// controller always sets a controller reference on the objects it creates, so an object under these
+// names without one is a manual copy or had its reference stripped; it is deleted too, because keeping
+// it could keep a revoked credential alive (the write paths update such an object in place).
 func (c *MCPRouteController) deletePerBackendResources(ctx context.Context, mcpRoute *aigv1b1.MCPRoute, httpRouteName string) error {
 	if err := c.deleteControlledPerBackendObject(ctx, mcpRoute, "HTTPRoute", httpRouteName, &gwapiv1.HTTPRoute{}); err != nil {
 		return err
@@ -993,6 +994,11 @@ func (c *MCPRouteController) ensureMCPBackendRefHTTPFilter(ctx context.Context, 
 			return fmt.Errorf("failed to create HTTPRouteFilter: %w", err)
 		}
 	} else {
+		// Same collision as for the credential Secret: the filter of another MCPRoute's backend must not be
+		// rewritten, and its credential Secret must not be deleted as "stale".
+		if controlledByAnotherOwner(&existingFilter, mcpRoute) {
+			return fmt.Errorf("HTTPRouteFilter %s is controlled by another MCPRoute whose backend derives the same object names; rename the backend", filterName)
+		}
 		previousCredentialSecretName := ""
 		if existingFilter.Spec.CredentialInjection != nil {
 			previousCredentialSecretName = string(existingFilter.Spec.CredentialInjection.Credential.ValueRef.Name)
@@ -1056,6 +1062,12 @@ func (c *MCPRouteController) ensureCredentialSecret(ctx context.Context, secretN
 			return fmt.Errorf("failed to create credential secret: %w", err)
 		}
 		return nil
+	}
+
+	// Per-backend object names derive from the route and backend names and can collide across MCPRoutes
+	// ("a"/"b-c" and "a-b"/"c"); never rewrite another route's credential.
+	if controlledByAnotherOwner(existing, mcpRoute) {
+		return fmt.Errorf("credential secret %s is controlled by another MCPRoute whose backend derives the same object names; rename the backend", secretName)
 	}
 
 	// Update if the credential value changed.

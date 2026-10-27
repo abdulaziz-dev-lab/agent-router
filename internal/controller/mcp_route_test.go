@@ -2030,43 +2030,90 @@ func TestMCPRouteController_Reconcile_DeniedRouteDeleted(t *testing.T) {
 	require.True(t, apierrors.IsNotFound(fakeClient.Get(t.Context(), client.ObjectKey{Name: mcpProxySharedBackendName, Namespace: "default"}, &sharedBackend)))
 }
 
-// TestMCPRouteController_Reconcile_DeniedBackendKeepsCollidingRouteObjects verifies that a denied
-// backend whose derived object names collide with another MCPRoute's backend leaves that route's
-// objects alone: route "github-mcp" with backend "prod" and route "github" with backend "mcp-prod"
-// both derive "<prefix>github-mcp-prod".
-func TestMCPRouteController_Reconcile_DeniedBackendKeepsCollidingRouteObjects(t *testing.T) {
-	fakeClient := requireNewFakeClientWithIndexesForMCP(t)
-	kubeClient := fakekube.NewClientset(
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token-a", Namespace: "default"}, Data: map[string][]byte{"apiKey": []byte("a-value")}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token-b", Namespace: "shared"}, Data: map[string][]byte{"apiKey": []byte("b-value")}},
-	)
-	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
-	c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), eventCh.Ch)
-	require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}}))
-	newRoute := func(name string, backend aigv1b1.MCPRouteBackendRef) *aigv1b1.MCPRoute {
-		return &aigv1b1.MCPRoute{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-			Spec:       aigv1b1.MCPRouteSpec{ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}}, BackendRefs: []aigv1b1.MCPRouteBackendRef{backend}},
-		}
-	}
-	first := newRoute("github-mcp", mcpRouteSecretRefBackend("prod", "default", "", "token-a"))
-	second := newRoute("github", mcpRouteSecretRefBackend("mcp-prod", "default", "shared", "token-b"))
-	require.Equal(t, mcpPerBackendRefHTTPRouteName(first.Name, "prod"), mcpPerBackendRefHTTPRouteName(second.Name, "mcp-prod"))
-	require.NoError(t, fakeClient.Create(t.Context(), first))
-	require.NoError(t, fakeClient.Create(t.Context(), second))
+// notPermittedMessage is the error and status text for a backend whose cross-namespace secretRef has
+// no ReferenceGrant: "backend <name>: " followed by the ReferenceNotPermittedError.
+func notPermittedMessage(backend, routeNamespace, secretName, secretNamespace string) string {
+	return fmt.Sprintf("backend %s: %s", backend, (&ReferenceNotPermittedError{
+		FromGroup: string(aiServiceBackendGroup), FromKind: mcpRouteKind, FromNamespace: routeNamespace,
+		TargetGroup: string(secretGroup), TargetKind: secretKind, TargetName: secretName, TargetNamespace: secretNamespace,
+	}).Error())
+}
 
-	_, err := c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(first)})
-	require.NoError(t, err)
-	requirePerBackendResources(t, fakeClient, kubeClient, first, "prod", true, "Bearer a-value")
-
-	// The second route's backend is denied on every reconcile, and every reconcile must leave the first
-	// route's HTTPRoute, HTTPRouteFilter and credential Secret in place.
-	for range 2 {
-		_, err = c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(second)})
-		require.ErrorContains(t, err, "backend mcp-prod: cross-namespace reference from MCPRoute in namespace default to Secret token-b in namespace shared is not permitted")
-		requirePerBackendResources(t, fakeClient, kubeClient, first, "prod", true, "Bearer a-value")
+// TestMCPRouteController_Reconcile_CollidingBackendLeavesTheOtherRouteAlone verifies that a backend
+// whose derived object names collide with another MCPRoute's backend never deletes or rewrites that
+// route's objects: route "github-mcp" with backend "prod" and route "github" with backend "mcp-prod"
+// both derive "<prefix>github-mcp-prod". The colliding backend fails with its denial or with an error
+// that names the collision, and the first route keeps its HTTPRoute, its HTTPRouteFilter with the
+// credential injection, and its credential value on every retry.
+func TestMCPRouteController_Reconcile_CollidingBackendLeavesTheOtherRouteAlone(t *testing.T) {
+	tests := []struct {
+		name      string
+		colliding aigv1b1.MCPRouteBackendRef
+		expError  string
+	}{
+		{
+			name:      "denied cross-namespace secretRef",
+			colliding: mcpRouteSecretRefBackend("mcp-prod", "default", "shared", "token-b"),
+			expError:  notPermittedMessage("mcp-prod", "default", "token-b", "shared"),
+		},
+		{
+			name:      "readable secretRef",
+			colliding: mcpRouteSecretRefBackend("mcp-prod", "default", "", "token-b"),
+			expError:  "credential secret ai-eg-mcp-cred-github-mcp-prod is controlled by another MCPRoute",
+		},
+		{
+			name: "inline key with the default injection policy",
+			colliding: aigv1b1.MCPRouteBackendRef{
+				BackendObjectReference: gwapiv1.BackendObjectReference{Name: "mcp-prod", Namespace: ptr.To(gwapiv1.Namespace("default"))},
+				SecurityPolicy:         &aigv1b1.MCPBackendSecurityPolicy{APIKey: &aigv1b1.MCPBackendAPIKey{Inline: ptr.To("b-value")}},
+			},
+			expError: "HTTPRouteFilter ai-eg-mcp-brf-github-mcp-prod is controlled by another MCPRoute",
+		},
 	}
-	requireMCPRouteCondition(t, fakeClient, second, aigv1b1.ConditionTypeNotAccepted, "backend mcp-prod: ")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := requireNewFakeClientWithIndexesForMCP(t)
+			kubeClient := fakekube.NewClientset(
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token-a", Namespace: "default"}, Data: map[string][]byte{"apiKey": []byte("a-value")}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token-b", Namespace: "default"}, Data: map[string][]byte{"apiKey": []byte("b-value")}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token-b", Namespace: "shared"}, Data: map[string][]byte{"apiKey": []byte("shared-b-value")}},
+			)
+			eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+			c := NewMCPRouteController(fakeClient, kubeClient, logr.Discard(), eventCh.Ch)
+			require.NoError(t, fakeClient.Create(t.Context(), &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}}))
+			newRoute := func(name string, backend aigv1b1.MCPRouteBackendRef) *aigv1b1.MCPRoute {
+				return &aigv1b1.MCPRoute{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+					Spec:       aigv1b1.MCPRouteSpec{ParentRefs: []gwapiv1.ParentReference{{Name: "gw"}}, BackendRefs: []aigv1b1.MCPRouteBackendRef{backend}},
+				}
+			}
+			first := newRoute("github-mcp", mcpRouteSecretRefBackend("prod", "default", "", "token-a"))
+			second := newRoute("github", tt.colliding)
+			require.Equal(t, mcpPerBackendRefHTTPRouteName(first.Name, "prod"), mcpPerBackendRefHTTPRouteName(second.Name, "mcp-prod"))
+			require.NoError(t, fakeClient.Create(t.Context(), first))
+			require.NoError(t, fakeClient.Create(t.Context(), second))
+
+			_, err := c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(first)})
+			require.NoError(t, err)
+			requireFirstIntact := func() {
+				t.Helper()
+				requirePerBackendResources(t, fakeClient, kubeClient, first, "prod", true, "Bearer a-value")
+				var filter egv1a1.HTTPRouteFilter
+				require.NoError(t, fakeClient.Get(t.Context(), client.ObjectKey{Name: mcpBackendRefFilterName(first, "prod"), Namespace: "default"}, &filter))
+				require.NotNil(t, filter.Spec.CredentialInjection, "the first route's filter must keep its credential injection")
+				require.Equal(t, mcpCredentialSecretName(first, "prod"), string(filter.Spec.CredentialInjection.Credential.ValueRef.Name))
+			}
+			requireFirstIntact()
+
+			// The second route fails on every reconcile and every reconcile must leave the first route alone.
+			for range 2 {
+				_, err = c.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(second)})
+				require.ErrorContains(t, err, tt.expError)
+				requireFirstIntact()
+			}
+			requireMCPRouteCondition(t, fakeClient, second, aigv1b1.ConditionTypeNotAccepted, tt.expError)
+		})
+	}
 }
 
 // TestMCPRouteController_deletePerBackendResources verifies which objects the per-backend cleanup
